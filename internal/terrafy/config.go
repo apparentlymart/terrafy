@@ -191,10 +191,12 @@ func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 				diags = append(diags, moreDiags...)
 				var alias string
 				if attr, exists := blockContent.Attributes["alias"]; exists {
-					moreDiags := gohcl.DecodeExpression(attr.Expr, nil, &alias)
-					diags = append(diags, moreDiags...)
-					if moreDiags.HasErrors() {
-						continue
+					if strings.HasSuffix(attr.NameRange.Filename, ".tfy") {
+						moreDiags := gohcl.DecodeExpression(attr.Expr, nil, &alias)
+						diags = append(diags, moreDiags...)
+						if moreDiags.HasErrors() {
+							continue
+						}
 					}
 				}
 				key := block.Labels[0]
