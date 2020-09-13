@@ -20,9 +20,9 @@ type resourceAddr struct {
 func (addr resourceAddr) String() string {
 	switch addr.Mode {
 	case "managed":
-		return fmt.Sprintf("%s.%s", addr.Type, addr.Mode)
+		return fmt.Sprintf("%s.%s", addr.Type, addr.Name)
 	case "data":
-		return fmt.Sprintf("data.%s.%s", addr.Type, addr.Mode)
+		return fmt.Sprintf("data.%s.%s", addr.Type, addr.Name)
 	default:
 		panic("invalid resource address mode")
 	}
