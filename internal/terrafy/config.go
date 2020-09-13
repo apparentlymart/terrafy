@@ -35,10 +35,11 @@ type resourceAttr struct {
 }
 
 type Config struct {
-	ProviderReqs    map[string]hcl.Expression
-	ProviderConfigs map[string]*hcl.Block
-	DataResources   map[resourceAddr]*hcl.Block
-	ImportConfigs   map[resourceAddr]*ImportConfig
+	ProviderReqs     map[string]hcl.Expression
+	ProviderConfigs  map[string]*hcl.Block
+	DataResources    map[resourceAddr]*hcl.Block
+	ManagedResources map[resourceAddr]*hcl.Block
+	ImportConfigs    map[resourceAddr]*ImportConfig
 
 	SourceFiles map[string]*hcl.File
 }
@@ -143,6 +144,27 @@ func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 					continue
 				}
 				ret.ProviderConfigs[key] = block
+
+			case "resource":
+				// We track the managed resources in the configuration only
+				// so that we can later skip generating new resource blocks
+				// for the resources that are already declared.
+				addr := resourceAddr{
+					Mode: "managed",
+					Type: block.Labels[0],
+					Name: block.Labels[1],
+				}
+				// TODO: Check that the labels are both valid identifiers.
+				if existing, exists := ret.ManagedResources[addr]; exists {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Duplicate managed resource configuration",
+						Detail:   fmt.Sprintf("A managed resource %s was already defined at %s.", addr.String(), existing.DefRange),
+						Subject:  block.DefRange.Ptr(),
+					})
+					continue
+				}
+				ret.ManagedResources[addr] = block
 
 			default:
 				panic("HCL produced a block type that wasn't in the schema")
@@ -289,6 +311,7 @@ var tfSchema = &hcl.BodySchema{
 	Blocks: []hcl.BlockHeaderSchema{
 		{Type: "terraform"},
 		{Type: "provider", LabelNames: []string{"local_name"}},
+		{Type: "resource", LabelNames: []string{"type", "name"}},
 	},
 }
 
