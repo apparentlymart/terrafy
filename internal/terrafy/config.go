@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/zclconf/go-cty/cty"
 )
 
 type resourceAddr struct {
@@ -28,10 +29,62 @@ func (addr resourceAddr) String() string {
 	}
 }
 
-type resourceAttr struct {
+func (addr resourceAddr) InstanceIDs(ids cty.Value) map[resourceInstanceAddr]string {
+	switch {
+	case ids.Type() == cty.String:
+		return map[resourceInstanceAddr]string{
+			{Resource: addr}: ids.AsString(),
+		}
+	case ids.Type().IsListType():
+		l := ids.LengthInt()
+		ret := make(map[resourceInstanceAddr]string, l)
+		i := 0
+		for it := ids.ElementIterator(); it.Next(); {
+			_, v := it.Element()
+			ret[resourceInstanceAddr{
+				Resource:    addr,
+				InstanceKey: i,
+			}] = v.AsString()
+			i++
+		}
+		return ret
+	case ids.Type().IsMapType():
+		l := ids.LengthInt()
+		ret := make(map[resourceInstanceAddr]string, l)
+		for it := ids.ElementIterator(); it.Next(); {
+			k, v := it.Element()
+			ret[resourceInstanceAddr{
+				Resource:    addr,
+				InstanceKey: k.AsString(),
+			}] = v.AsString()
+		}
+		return ret
+	default:
+		panic("invalid instance ids value")
+	}
+}
+
+type resourceInstanceAddr struct {
 	Resource    resourceAddr
 	InstanceKey interface{}
-	Name        string
+}
+
+func (addr resourceInstanceAddr) String() string {
+	switch k := addr.InstanceKey.(type) {
+	case string:
+		return fmt.Sprintf("%s[%q]", addr.Resource.String(), k)
+	case int:
+		return fmt.Sprintf("%s[%d]", addr.Resource.String(), k)
+	case nil:
+		return addr.Resource.String()
+	default:
+		panic("invalid resource instance key")
+	}
+}
+
+type resourceAttr struct {
+	Instance resourceInstanceAddr
+	Name     string
 }
 
 type Config struct {

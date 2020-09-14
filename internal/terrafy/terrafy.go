@@ -14,6 +14,10 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/hashicorp/terraform-exec/tfexec"
+	tfjson "github.com/hashicorp/terraform-json"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
+	"github.com/zclconf/go-cty/cty/gocty"
 )
 
 // Options represents execution options that are customizable from the
@@ -118,8 +122,28 @@ func Run(opts *Options) (map[string]*hcl.File, hcl.Diagnostics) {
 		})
 		return cfg.SourceFiles, diags
 	}
-	idsRaw := state.Values.Outputs["ids"].Value
-	spew.Dump(idsRaw)
+	idsRaw := state.Values.Outputs["ids"].Value.(map[string]interface{})
+
+	// We've now completed our work with the temporary directory: we've read all
+	// of the data resources and evaluated all of the "id" arguments in the
+	// import blocks. The rest of our work will be with the main configuration
+	// in the directory where we were run.
+	tf, err = tfexec.NewTerraform(".", opts.TerraformExec)
+	if err != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Failed to initialize Terraform CLI",
+			Detail:   fmt.Sprintf("Terraform executable at %s is malfunctioning or not available: %s.", opts.TerraformExec, err),
+		})
+		return cfg.SourceFiles, diags
+	}
+
+	// Now our task is to visit each of the resource instances the user
+	// declared to import and see whether each one is already accounted for
+	// in the state (if not, we'll import it) and in the configuration
+	// (if not, we'll generate it from what's in the state).
+	moreDiags = doImporting(cfg, idsRaw, tf)
+	diags = append(diags, moreDiags...)
 
 	return cfg.SourceFiles, diags
 }
@@ -320,6 +344,88 @@ func generatePrepConfig(targetDir string, cfg *Config) hcl.Diagnostics {
 			Detail:   fmt.Sprintf("Could not create a temporary data configuration file: %s.", err),
 		})
 		return diags
+	}
+
+	return diags
+}
+
+func doImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terraform) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	state, err := tf.Show(context.Background())
+	if err != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Failed to read current state",
+			Detail:   fmt.Sprintf("Could not read the latest state snapshot for this configuration:\n\n%s", err),
+		})
+		return diags
+	}
+	var existing []*tfjson.StateResource
+	if state.Values != nil && state.Values.RootModule != nil {
+		existing = state.Values.RootModule.Resources
+	}
+	spew.Dump(existing)
+
+	for addrStr, rawIds := range idsRaw {
+		var imp *ImportConfig
+		for foundAddr, foundImp := range cfg.ImportConfigs {
+			if foundAddr.String() == addrStr {
+				imp = foundImp
+			}
+		}
+		if imp == nil {
+			// weird...
+			continue
+		}
+
+		idsTy, err := gocty.ImpliedType(rawIds)
+		if err != nil {
+			// It would be odd to get here.
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid id value",
+				Detail:   fmt.Sprintf("The id argument for %s is invalid: %s.", addrStr, err),
+				Subject:  imp.ID.Range().Ptr(),
+			})
+			continue
+		}
+
+		givenIDsVal, err := gocty.ToCtyValue(rawIds, idsTy)
+		if err != nil {
+			// It would be odd to get here.
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid id value",
+				Detail:   fmt.Sprintf("The id argument for %s is invalid: %s.", addrStr, err),
+				Subject:  imp.ID.Range().Ptr(),
+			})
+			continue
+		}
+
+		// idsTy should be something convertable to either a string, a list
+		// of strings, or a map of strings. If not, it's invalid.
+		var idsVal cty.Value
+		for _, wantTy := range []cty.Type{cty.String, cty.List(cty.String), cty.Map(cty.String)} {
+			idsVal, err = convert.Convert(givenIDsVal, wantTy)
+			if err != nil {
+				idsVal = cty.NilVal
+				continue
+			}
+			break
+		}
+		if idsVal == cty.NilVal {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid id value",
+				Detail:   fmt.Sprintf("The id argument for %s is invalid: must be a string, a list of strings, or a map of strings.", addrStr),
+				Subject:  imp.ID.Range().Ptr(),
+			})
+			continue
+		}
+
+		instanceIDs := imp.Addr.InstanceIDs(idsVal)
+		fmt.Printf("for %s we have %#v\n", addrStr, instanceIDs)
 	}
 
 	return diags
