@@ -1,23 +1,22 @@
 package terrafy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/hashicorp/hcl/v2"
+	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/hashicorp/terraform-exec/tfexec"
 	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/zclconf/go-cty/cty"
-	"github.com/zclconf/go-cty/cty/convert"
-	"github.com/zclconf/go-cty/cty/gocty"
 )
 
 // Options represents execution options that are customizable from the
@@ -142,8 +141,43 @@ func Run(opts *Options) (map[string]*hcl.File, hcl.Diagnostics) {
 	// declared to import and see whether each one is already accounted for
 	// in the state (if not, we'll import it) and in the configuration
 	// (if not, we'll generate it from what's in the state).
-	moreDiags = doImporting(cfg, idsRaw, tf)
+	plan, moreDiags := planImporting(cfg, idsRaw, tf)
 	diags = append(diags, moreDiags...)
+	if diags.HasErrors() {
+		return cfg.SourceFiles, diags
+	}
+
+	if len(plan.ToState) == 0 && len(plan.ToConfig) == 0 {
+		fmt.Printf("Nothing to do! Everything in your terrafy configuration is already known to Terraform.\n\n")
+		return cfg.SourceFiles, diags
+	}
+
+	plan.Sort()
+	fmt.Printf("Import plan:\n")
+	for _, planItem := range plan.ToState {
+		fmt.Printf("- Create Terraform state binding from %s to remote object %q\n", planItem.Target, planItem.ID)
+	}
+	for _, planItem := range plan.ToConfig {
+		fmt.Printf("- Generate a new %s configuration block in %s\n", planItem.Target, planItem.Filename)
+	}
+
+	fmt.Printf("\nDo you want to proceed? (Only \"yes\" will be accepted to confirm.)\n> ")
+	termR := bufio.NewReader(os.Stdin)
+	answer, err := termR.ReadString('\n')
+	if err != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Failed to read confirmation",
+			Detail:   fmt.Sprintf("Error reading the confirmation response: %s.", err),
+		})
+		return cfg.SourceFiles, diags
+	}
+	answer = strings.TrimSpace(answer)
+	if answer != "yes" {
+		fmt.Printf("Cancelled.\n")
+		return cfg.SourceFiles, diags
+	}
+	fmt.Println("")
 
 	return cfg.SourceFiles, diags
 }
@@ -349,7 +383,7 @@ func generatePrepConfig(targetDir string, cfg *Config) hcl.Diagnostics {
 	return diags
 }
 
-func doImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terraform) hcl.Diagnostics {
+func planImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terraform) (*importPlan, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 
 	state, err := tf.Show(context.Background())
@@ -359,19 +393,22 @@ func doImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terrafor
 			Summary:  "Failed to read current state",
 			Detail:   fmt.Sprintf("Could not read the latest state snapshot for this configuration:\n\n%s", err),
 		})
-		return diags
+		return nil, diags
 	}
 	var existing []*tfjson.StateResource
 	if state.Values != nil && state.Values.RootModule != nil {
 		existing = state.Values.RootModule.Resources
 	}
-	spew.Dump(existing)
 
+	var importToState []*importPlanState
+	var importToConfig []*importPlanConfig
 	for addrStr, rawIds := range idsRaw {
 		var imp *ImportConfig
+		var addr resourceAddr
 		for foundAddr, foundImp := range cfg.ImportConfigs {
 			if foundAddr.String() == addrStr {
 				imp = foundImp
+				addr = foundAddr
 			}
 		}
 		if imp == nil {
@@ -379,54 +416,107 @@ func doImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terrafor
 			continue
 		}
 
-		idsTy, err := gocty.ImpliedType(rawIds)
+		idsVal, err := prepareRawIDs(rawIds)
 		if err != nil {
-			// It would be odd to get here.
 			diags = diags.Append(&hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Invalid id value",
 				Detail:   fmt.Sprintf("The id argument for %s is invalid: %s.", addrStr, err),
-				Subject:  imp.ID.Range().Ptr(),
-			})
-			continue
-		}
-
-		givenIDsVal, err := gocty.ToCtyValue(rawIds, idsTy)
-		if err != nil {
-			// It would be odd to get here.
-			diags = diags.Append(&hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  "Invalid id value",
-				Detail:   fmt.Sprintf("The id argument for %s is invalid: %s.", addrStr, err),
-				Subject:  imp.ID.Range().Ptr(),
-			})
-			continue
-		}
-
-		// idsTy should be something convertable to either a string, a list
-		// of strings, or a map of strings. If not, it's invalid.
-		var idsVal cty.Value
-		for _, wantTy := range []cty.Type{cty.String, cty.List(cty.String), cty.Map(cty.String)} {
-			idsVal, err = convert.Convert(givenIDsVal, wantTy)
-			if err != nil {
-				idsVal = cty.NilVal
-				continue
-			}
-			break
-		}
-		if idsVal == cty.NilVal {
-			diags = diags.Append(&hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  "Invalid id value",
-				Detail:   fmt.Sprintf("The id argument for %s is invalid: must be a string, a list of strings, or a map of strings.", addrStr),
 				Subject:  imp.ID.Range().Ptr(),
 			})
 			continue
 		}
 
 		instanceIDs := imp.Addr.InstanceIDs(idsVal)
-		fmt.Printf("for %s we have %#v\n", addrStr, instanceIDs)
+	Instances:
+		for instAddr, id := range instanceIDs {
+			// If this instance is already in the state then we'll skip
+			// trying to import it again, because that'd fail.
+			for _, candidate := range existing {
+				if candidate.Address == instAddr.String() {
+					continue Instances
+				}
+			}
+
+			importToState = append(importToState, &importPlanState{
+				ID:     id,
+				Target: instAddr,
+			})
+
+			/*
+				err := tf.Import(context.Background(), instAddr.String(), id, tfexec.AllowMissingConfig(true))
+				if err != nil {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Import failed",
+						Detail:   fmt.Sprintf("Could not import %s with id %q:\n\n%s", instAddr, id, err),
+					})
+					return nil, diags
+				}
+			*/
+		}
+
+		_, alreadyInConfig := cfg.ManagedResources[addr]
+		if !alreadyInConfig {
+			sourceFilename := imp.DefRange.Filename
+			targetFilename := "imported.tf"
+			if strings.HasSuffix(sourceFilename, ".tfy") {
+				targetFilename = sourceFilename[:len(sourceFilename)-1]
+			}
+
+			importToConfig = append(importToConfig, &importPlanConfig{
+				Target:   addr,
+				Filename: targetFilename,
+			})
+		}
 	}
 
-	return diags
+	return &importPlan{
+		ToState:  importToState,
+		ToConfig: importToConfig,
+	}, diags
+}
+
+func prepareRawIDs(raw interface{}) (cty.Value, error) {
+	switch rv := raw.(type) {
+	case []interface{}:
+		norm := make([]cty.Value, len(rv))
+		for i := range rv {
+			s, err := prepareRawID(rv[i])
+			if err != nil {
+				return cty.NilVal, err
+			}
+			norm[i] = cty.StringVal(s)
+		}
+		return cty.ListVal(norm), nil
+	case map[string]interface{}:
+		norm := make(map[string]cty.Value, len(rv))
+		for k := range rv {
+			s, err := prepareRawID(rv[k])
+			if err != nil {
+				return cty.NilVal, err
+			}
+			norm[k] = cty.StringVal(s)
+		}
+		return cty.MapVal(norm), nil
+	default:
+		s, err := prepareRawID(raw)
+		if err != nil {
+			return cty.NilVal, err
+		}
+		return cty.StringVal(s), nil
+	}
+}
+
+func prepareRawID(raw interface{}) (string, error) {
+	switch rv := raw.(type) {
+	case string:
+		return rv, nil
+	case float64:
+		// Because ids are sometimes integers, we'll accept a number as an
+		// attempt to use some decimal digits as an id.
+		return strconv.FormatFloat(rv, 'f', -1, 64), nil
+	default:
+		return "", fmt.Errorf("must be a string, a list of strings, or a map of strings")
+	}
 }
