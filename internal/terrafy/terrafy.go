@@ -179,6 +179,9 @@ func Run(opts *Options) (map[string]*hcl.File, hcl.Diagnostics) {
 	}
 	fmt.Println("")
 
+	moreDiags = applyImporting(plan, tf)
+	diags = append(diags, moreDiags...)
+
 	return cfg.SourceFiles, diags
 }
 
@@ -442,18 +445,6 @@ func planImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terraf
 				ID:     id,
 				Target: instAddr,
 			})
-
-			/*
-				err := tf.Import(context.Background(), instAddr.String(), id, tfexec.AllowMissingConfig(true))
-				if err != nil {
-					diags = diags.Append(&hcl.Diagnostic{
-						Severity: hcl.DiagError,
-						Summary:  "Import failed",
-						Detail:   fmt.Sprintf("Could not import %s with id %q:\n\n%s", instAddr, id, err),
-					})
-					return nil, diags
-				}
-			*/
 		}
 
 		_, alreadyInConfig := cfg.ManagedResources[addr]
@@ -506,6 +497,79 @@ func prepareRawIDs(raw interface{}) (cty.Value, error) {
 		}
 		return cty.StringVal(s), nil
 	}
+}
+
+func applyImporting(plan *importPlan, tf *tfexec.Terraform) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	fmt.Printf("Importing:\n")
+	for _, action := range plan.ToState {
+		targetStr := action.Target.String()
+		dispTargetStr := strings.Replace(targetStr, "'", "'\\''", 0)
+		dispIDStr := strings.Replace(action.ID, "'", "'\\''", 0)
+		fmt.Printf("- terraform import '%s' '%s'\n", dispTargetStr, dispIDStr)
+
+		err := tf.Import(context.Background(), targetStr, action.ID, tfexec.AllowMissingConfig(true))
+		if err != nil {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Import failed",
+				Detail:   fmt.Sprintf("Could not import %s with id %q:\n\n%s", targetStr, action.ID, err),
+			})
+			// We could potentially continue trying to import other objects
+			// here, but we'll assume that the user would rather stop and
+			// address whatever issue made this fail rather than potentially
+			// see a series of repeated similar failures, if the problem is
+			// a general one, such as the state storage server being
+			//  unreachable.
+			return diags
+		}
+	}
+
+	for _, action := range plan.ToConfig {
+		fmt.Printf("- adding a new resource %q %q block to %s\n", action.Target.Type, action.Target.Name, action.Filename)
+
+		// If the target file already exists then we'll append a new block
+		// to it, but if it doesn't exist then we'll just create a new file.
+		var oldSrc []byte
+		if src, err := ioutil.ReadFile(action.Filename); err == nil {
+			oldSrc = src
+		}
+
+		f, moreDiags := hclwrite.ParseConfig(oldSrc, action.Filename, hcl.InitialPos)
+		diags = append(diags, moreDiags...)
+		if moreDiags.HasErrors() {
+			// Something funny seems to be going on, because we presumably
+			// managed to parse this same file earlier on using the main
+			// hclsyntax parser.
+			return diags
+		}
+
+		body := f.Body()
+		body.AppendNewline()
+		block := body.AppendNewBlock("resource", []string{action.Target.Type, action.Target.Name})
+		// TODO: If the state shows this resource as belonging to a provider
+		// configuration other than the one its type name seems to imply,
+		// we'll need to generate a "provider = " declaration.
+		block = block // TODO: continue to append stuff to this
+
+		newSrc := f.Bytes()
+		err := ioutil.WriteFile(action.Filename, newSrc, os.ModePerm)
+		if err != nil {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Failed to update configuration file",
+				Detail:   fmt.Sprintf("Could not update %s with new configuration for %s: %s.", action.Filename, action.Target, err),
+			})
+			return diags
+		}
+	}
+
+	if !diags.HasErrors() {
+		fmt.Printf("\nAll done! Confirm the result by trying to create a Terraform plan:\n    terraform plan\n\n")
+	}
+
+	return diags
 }
 
 func prepareRawID(raw interface{}) (string, error) {
