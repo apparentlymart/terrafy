@@ -573,6 +573,7 @@ func applyImporting(plan *importPlan, tf *tfexec.Terraform, schemas *tfjson.Prov
 		// configuration for inconsistent values, even though the result will
 		// not be idomatic Terraform code like a human would've written.
 		instances := map[resourceInstanceAddr]*tfjson.StateResource{}
+		var schema *tfjson.Schema
 		for _, rs := range existing {
 			thisAddr := resourceAddr{
 				Mode: rs.Mode,
@@ -596,6 +597,37 @@ func applyImporting(plan *importPlan, tf *tfexec.Terraform, schemas *tfjson.Prov
 				InstanceKey: index,
 			}
 			instances[instAddr] = rs
+
+			// We'll need to check if the saved data is in the current
+			// schema version, because we can't interpret if not.
+			providerAddr := rs.ProviderName
+			providerSchema := schemas.Schemas[providerAddr]
+			if providerSchema == nil {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Missing provider schema",
+					Detail:   fmt.Sprintf("Terraform did not find a schema for provider %s, so Terrafy can't analyze the imported object.", providerAddr),
+				})
+				return diags
+			}
+			resourceTypeSchema := providerSchema.ResourceSchemas[thisAddr.Type]
+			if resourceTypeSchema == nil {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Unknown resource type",
+					Detail:   fmt.Sprintf("Provider %s doesn't have a schema for resource type %q, so Terrafy can't analyze the imported resource %s.", providerAddr, thisAddr.Type, thisAddr),
+				})
+				return diags
+			}
+			if got, want := rs.SchemaVersion, resourceTypeSchema.Version; got != want {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Incorrect resource instance schema version",
+					Detail:   fmt.Sprintf("Resource instance %s has its data saved in resource type schema version %d, but the current version is %d so Terrafy can't analyze the data until the object is upgraded.\n\nRefreshing your already-imported objects may help. Try:\n    terraform refresh", instAddr, got, want),
+				})
+				return diags
+			}
+			schema = resourceTypeSchema
 		}
 
 		// If the target file already exists then we'll append a new block
@@ -705,6 +737,14 @@ func applyImporting(plan *importPlan, tf *tfexec.Terraform, schemas *tfjson.Prov
 		}
 
 		if len(instances) > 0 {
+			// If we have at least one instance then we should've populated
+			// "schema" above based on one of the instances, so we can
+			// safely use it here.
+			moreDiags := generateResourceConfig(action.Target, instances, schema, blockBody)
+			diags = append(diags, moreDiags...)
+			if moreDiags.HasErrors() {
+				return diags
+			}
 		} else {
 			// We can't generate the configuration body if we don't have
 			// at least one instance, so we'll just write in a placeholder
