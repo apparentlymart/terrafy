@@ -13,8 +13,9 @@ type importPlanState struct {
 }
 
 type importPlanConfig struct {
-	Target   resourceAddr
-	Filename string
+	Target     resourceAddr
+	RepeatMode string // "", "count", or "for_each"
+	Filename   string
 }
 
 func (p *importPlan) Sort() {

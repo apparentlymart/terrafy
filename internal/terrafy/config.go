@@ -9,20 +9,21 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
+	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/zclconf/go-cty/cty"
 )
 
 type resourceAddr struct {
-	Mode string
+	Mode tfjson.ResourceMode
 	Type string
 	Name string
 }
 
 func (addr resourceAddr) String() string {
 	switch addr.Mode {
-	case "managed":
+	case tfjson.ManagedResourceMode:
 		return fmt.Sprintf("%s.%s", addr.Type, addr.Name)
-	case "data":
+	case tfjson.DataResourceMode:
 		return fmt.Sprintf("data.%s.%s", addr.Type, addr.Name)
 	default:
 		panic("invalid resource address mode")
@@ -78,7 +79,7 @@ func (addr resourceInstanceAddr) String() string {
 	case nil:
 		return addr.Resource.String()
 	default:
-		panic("invalid resource instance key")
+		panic(fmt.Sprintf("invalid resource instance key (%T)", k))
 	}
 }
 
@@ -203,7 +204,7 @@ func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 				// so that we can later skip generating new resource blocks
 				// for the resources that are already declared.
 				addr := resourceAddr{
-					Mode: "managed",
+					Mode: tfjson.ManagedResourceMode,
 					Type: block.Labels[0],
 					Name: block.Labels[1],
 				}
@@ -291,7 +292,7 @@ func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 
 			case "data":
 				addr := resourceAddr{
-					Mode: "data",
+					Mode: tfjson.DataResourceMode,
 					Type: block.Labels[0],
 					Name: block.Labels[1],
 				}
@@ -309,7 +310,7 @@ func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 
 			case "import":
 				addr := resourceAddr{
-					Mode: "managed",
+					Mode: tfjson.ManagedResourceMode,
 					Type: block.Labels[0],
 					Name: block.Labels[1],
 				}

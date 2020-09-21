@@ -79,7 +79,7 @@ func Run(opts *Options) (map[string]*hcl.File, hcl.Diagnostics) {
 		return cfg.SourceFiles, diags
 	}
 
-	_, err = tf.ProvidersSchema(context.Background())
+	schemas, err := tf.ProvidersSchema(context.Background())
 	if err != nil {
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity: hcl.DiagError,
@@ -179,7 +179,7 @@ func Run(opts *Options) (map[string]*hcl.File, hcl.Diagnostics) {
 	}
 	fmt.Println("")
 
-	moreDiags = applyImporting(plan, tf)
+	moreDiags = applyImporting(plan, tf, schemas)
 	diags = append(diags, moreDiags...)
 
 	return cfg.SourceFiles, diags
@@ -455,9 +455,20 @@ func planImporting(cfg *Config, idsRaw map[string]interface{}, tf *tfexec.Terraf
 				targetFilename = sourceFilename[:len(sourceFilename)-1]
 			}
 
+			var repeatMode string
+			switch {
+			case idsVal.Type().IsListType():
+				repeatMode = "count"
+			case idsVal.Type().IsMapType():
+				repeatMode = "for_each"
+			default:
+				repeatMode = "" // no repetition at all
+			}
+
 			importToConfig = append(importToConfig, &importPlanConfig{
-				Target:   addr,
-				Filename: targetFilename,
+				Target:     addr,
+				RepeatMode: repeatMode,
+				Filename:   targetFilename,
 			})
 		}
 	}
@@ -479,6 +490,9 @@ func prepareRawIDs(raw interface{}) (cty.Value, error) {
 			}
 			norm[i] = cty.StringVal(s)
 		}
+		if len(norm) == 0 {
+			return cty.ListValEmpty(cty.String), nil
+		}
 		return cty.ListVal(norm), nil
 	case map[string]interface{}:
 		norm := make(map[string]cty.Value, len(rv))
@@ -488,6 +502,9 @@ func prepareRawIDs(raw interface{}) (cty.Value, error) {
 				return cty.NilVal, err
 			}
 			norm[k] = cty.StringVal(s)
+		}
+		if len(norm) == 0 {
+			return cty.MapValEmpty(cty.String), nil
 		}
 		return cty.MapVal(norm), nil
 	default:
@@ -499,7 +516,7 @@ func prepareRawIDs(raw interface{}) (cty.Value, error) {
 	}
 }
 
-func applyImporting(plan *importPlan, tf *tfexec.Terraform) hcl.Diagnostics {
+func applyImporting(plan *importPlan, tf *tfexec.Terraform, schemas *tfjson.ProviderSchemas) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	fmt.Printf("Importing:\n")
@@ -526,8 +543,60 @@ func applyImporting(plan *importPlan, tf *tfexec.Terraform) hcl.Diagnostics {
 		}
 	}
 
+	// The import operations above should've updated the state, so we'll
+	// now need to fetch a fresh snapshot to get the data for those
+	// imported objects so we can copy the values into the configuration.
+	fmt.Printf("- fetching the latest Terraform state snapshot\n")
+	state, err := tf.Show(context.Background())
+	if err != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Failed to read state snapshot",
+			Detail:   fmt.Sprintf("Could not read the latest Terraform state snapshot:\n\n%s", err),
+		})
+		return diags
+	}
+	var existing []*tfjson.StateResource
+	if state.Values != nil && state.Values.RootModule != nil {
+		existing = state.Values.RootModule.Resources
+	}
+
 	for _, action := range plan.ToConfig {
 		fmt.Printf("- adding a new resource %q %q block to %s\n", action.Target.Type, action.Target.Name, action.Filename)
+
+		// We need to collect up all of the (potentially many) instances that
+		// are associated with this resource, which we'll use to derive our
+		// initial configuration. This only really works when all of the
+		// instances agree on a consistent value, which will tend not to
+		// be true for at least one instance of each multi-instance resource,
+		// but we'll still make a best effort to generate a working
+		// configuration for inconsistent values, even though the result will
+		// not be idomatic Terraform code like a human would've written.
+		instances := map[resourceInstanceAddr]*tfjson.StateResource{}
+		for _, rs := range existing {
+			thisAddr := resourceAddr{
+				Mode: rs.Mode,
+				Type: rs.Type,
+				Name: rs.Name,
+			}
+			if thisAddr != action.Target {
+				continue
+			}
+			index := rs.Index
+			if f, ok := index.(float64); ok {
+				// The tfjson docs state that Index will be an int for
+				// instances created with "count", but in practice it seems
+				// to use float64, at least in some cases. Therefore we'll
+				// tolerate that here, but in a way that is resilient to
+				// the bug being fixed upstream later.
+				index = int(f)
+			}
+			instAddr := resourceInstanceAddr{
+				Resource:    thisAddr,
+				InstanceKey: index,
+			}
+			instances[instAddr] = rs
+		}
 
 		// If the target file already exists then we'll append a new block
 		// to it, but if it doesn't exist then we'll just create a new file.
@@ -548,10 +617,110 @@ func applyImporting(plan *importPlan, tf *tfexec.Terraform) hcl.Diagnostics {
 		body := f.Body()
 		body.AppendNewline()
 		block := body.AppendNewBlock("resource", []string{action.Target.Type, action.Target.Name})
+		blockBody := block.Body()
+		hasMetaArgs := false // set to true if we add any meta-arguments below
+		switch action.RepeatMode {
+		case "for_each":
+			hasMetaArgs = true
+			// With the information we have we can only determine the for_each
+			// keys, not any values they ought to be associated with. Therefore
+			// we'll generate a for_each over a set to start, but annotate
+			// that the user ought to think about a better value to iterate
+			// over once the import is complete.
+			blockBody.AppendUnstructuredTokens(hclwrite.Tokens{
+				{
+					Type:  hclsyntax.TokenComment,
+					Bytes: []byte("# IMPORT-TODO: Consider whether this should be derived from elsewhere in the configuration.\n"),
+				},
+			})
+			// hclwrite's built-in expression builders can't currently generate
+			// a call to the "toset" function, so we'll generate this manually.
+			// (hclwrite will insert spaces automatically so that the resulting
+			// indentation is idiomatic.)
+			var exprTokens hclwrite.Tokens
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenIdent,
+				Bytes: []byte("toset"),
+			})
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenOParen,
+				Bytes: []byte{'('},
+			})
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenOBrack,
+				Bytes: []byte{'['},
+			})
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenNewline,
+				Bytes: []byte{'\n'},
+			})
+			for addr := range instances {
+				v, ok := addr.InstanceKey.(string)
+				if !ok {
+					// weird, but we'll ignore it to be robust
+					continue
+				}
+				strTokens := hclwrite.TokensForValue(cty.StringVal(v))
+				exprTokens = append(exprTokens, strTokens...)
+				exprTokens = append(exprTokens, &hclwrite.Token{
+					Type:  hclsyntax.TokenComma,
+					Bytes: []byte{','},
+				})
+				exprTokens = append(exprTokens, &hclwrite.Token{
+					Type:  hclsyntax.TokenNewline,
+					Bytes: []byte{'\n'},
+				})
+			}
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenCBrack,
+				Bytes: []byte{']'},
+			})
+			exprTokens = append(exprTokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenCParen,
+				Bytes: []byte{')'},
+			})
+			blockBody.SetAttributeRaw("for_each", exprTokens)
+		case "count":
+			hasMetaArgs = true
+
+			// Our "count" value will be the highest index we have, plus one.
+			highest := -1
+			for addr := range instances {
+				if v, ok := addr.InstanceKey.(int); ok {
+					if v > highest {
+						highest = v
+					}
+				}
+			}
+			count := highest + 1
+			blockBody.SetAttributeValue("count", cty.NumberIntVal(int64(count)))
+		}
 		// TODO: If the state shows this resource as belonging to a provider
 		// configuration other than the one its type name seems to imply,
 		// we'll need to generate a "provider = " declaration.
-		block = block // TODO: continue to append stuff to this
+
+		if hasMetaArgs {
+			// Separate the meta-arguments from the main arguments.
+			blockBody.AppendNewline()
+		}
+
+		if len(instances) > 0 {
+		} else {
+			// We can't generate the configuration body if we don't have
+			// at least one instance, so we'll just write in a placeholder
+			// comment instead and emit a warning about it.
+			blockBody.AppendUnstructuredTokens(hclwrite.Tokens{
+				{
+					Type:  hclsyntax.TokenComment,
+					Bytes: []byte("# IMPORT-TODO: Write a configuration for hypothetical future instances of this resource.\n"),
+				},
+			})
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagWarning,
+				Summary:  "Resource with no instances",
+				Detail:   fmt.Sprintf("Imported resource %s has no instances at import time, so Terrafy cannot generate an initial configuration for it.", action.Target),
+			})
+		}
 
 		newSrc := f.Bytes()
 		err := ioutil.WriteFile(action.Filename, newSrc, os.ModePerm)
