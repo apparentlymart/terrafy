@@ -108,10 +108,11 @@ type ImportConfig struct {
 func LoadConfig(dir string) (*Config, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 	ret := &Config{
-		ProviderReqs:    map[string]hcl.Expression{},
-		ProviderConfigs: map[string]*hcl.Block{},
-		DataResources:   map[resourceAddr]*hcl.Block{},
-		ImportConfigs:   map[resourceAddr]*ImportConfig{},
+		ProviderReqs:     map[string]hcl.Expression{},
+		ProviderConfigs:  map[string]*hcl.Block{},
+		DataResources:    map[resourceAddr]*hcl.Block{},
+		ManagedResources: map[resourceAddr]*hcl.Block{},
+		ImportConfigs:    map[resourceAddr]*ImportConfig{},
 	}
 
 	tfFiles, tfyFiles, err := findConfigFiles(dir)
