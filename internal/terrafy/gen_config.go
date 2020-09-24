@@ -51,12 +51,12 @@ func generateResourceConfig(addr resourceAddr, instances map[resourceInstanceAdd
 		instVals[addr] = obj
 	}
 
-	moreDiags := generateConfigBody(addr, nil, instVals, schema.Block, body)
+	moreDiags := generateConfigBody(addr, instVals, schema.Block, body)
 	diags = append(diags, moreDiags...)
 	return diags
 }
 
-func generateConfigBody(addr resourceAddr, path cty.Path, vals map[resourceInstanceAddr]cty.Value, schema *tfjson.SchemaBlock, body *hclwrite.Body) hcl.Diagnostics {
+func generateConfigBody(addr resourceAddr, vals map[resourceInstanceAddr]cty.Value, schema *tfjson.SchemaBlock, body *hclwrite.Body) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	attrNames := make([]string, 0, len(schema.Attributes))
@@ -90,16 +90,82 @@ func generateConfigBody(addr resourceAddr, path cty.Path, vals map[resourceInsta
 			attrVals[instAddr] = obj.GetAttr(name)
 		}
 
-		moreDiags := generateConfigAttribute(addr, path, name, attrVals, attrS, body)
+		moreDiags := generateConfigAttribute(addr, name, attrVals, attrS, body)
 		diags = append(diags, moreDiags...)
 	}
 
-	// TODO: Also generate the nested blocks, if any.
+	for _, typeName := range blockTypeNames {
+		nestedS := schema.NestedBlocks[typeName]
+		switch nestedS.NestingMode {
+		case tfjson.SchemaNestingModeSingle:
+			for instAddr, obj := range vals {
+				if !obj.Type().HasAttribute(typeName) {
+					attrVals[instAddr] = cty.NullVal(schemaBlockImpliedType(nestedS.Block))
+				}
+				attrVals[instAddr] = obj.GetAttr(typeName)
+			}
+			moreDiags := generateConfigBlock(addr, typeName, nil, attrVals, nestedS, body)
+			diags = append(diags, moreDiags...)
+		case tfjson.SchemaNestingModeList, tfjson.SchemaNestingModeSet:
+			attrValSlices := make(map[resourceInstanceAddr][]cty.Value, len(attrVals))
+			maxLen := 0
+			for instAddr, obj := range vals {
+				if !obj.Type().HasAttribute(typeName) {
+					attrValSlices[instAddr] = nil
+				}
+				attrValSlices[instAddr] = obj.GetAttr(typeName).AsValueSlice()
+				if l := len(attrValSlices[instAddr]); l > maxLen {
+					maxLen = l
+				}
+			}
+
+			for i := 0; i < maxLen; i++ {
+				for instAddr, objs := range attrValSlices {
+					if len(objs) > i {
+						attrVals[instAddr] = objs[i]
+					} else {
+						attrVals[instAddr] = cty.NullVal(schemaBlockImpliedType(nestedS.Block))
+					}
+				}
+				moreDiags := generateConfigBlock(addr, typeName, nil, attrVals, nestedS, body)
+				diags = append(diags, moreDiags...)
+			}
+
+		case tfjson.SchemaNestingModeMap:
+			attrValMaps := make(map[resourceInstanceAddr]map[string]cty.Value, len(attrVals))
+			allKeys := make(map[string]struct{})
+			for instAddr, obj := range vals {
+				if !obj.Type().HasAttribute(typeName) {
+					attrValMaps[instAddr] = nil
+				}
+				attrValMaps[instAddr] = obj.GetAttr(typeName).AsValueMap()
+				for k := range attrValMaps[instAddr] {
+					allKeys[k] = struct{}{}
+				}
+			}
+			allKeyNames := make([]string, 0, len(allKeys))
+			for k := range allKeys {
+				allKeyNames = append(allKeyNames, k)
+			}
+			sort.Strings(allKeyNames)
+
+			for _, k := range allKeyNames {
+				for instAddr, objs := range attrValMaps {
+					attrVals[instAddr] = objs[k]
+					if attrVals[instAddr] == cty.NilVal {
+						attrVals[instAddr] = cty.NullVal(schemaBlockImpliedType(nestedS.Block))
+					}
+				}
+				moreDiags := generateConfigBlock(addr, typeName, []string{k}, attrVals, nestedS, body)
+				diags = append(diags, moreDiags...)
+			}
+		}
+	}
 
 	return diags
 }
 
-func generateConfigAttribute(addr resourceAddr, containerPath cty.Path, name string, vals map[resourceInstanceAddr]cty.Value, schema *tfjson.SchemaAttribute, body *hclwrite.Body) hcl.Diagnostics {
+func generateConfigAttribute(addr resourceAddr, name string, vals map[resourceInstanceAddr]cty.Value, schema *tfjson.SchemaAttribute, body *hclwrite.Body) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
 	// In the ideal case all of the values are equal and so we can just generate
@@ -233,4 +299,9 @@ func generateConfigAttribute(addr resourceAddr, containerPath cty.Path, name str
 	body.SetAttributeRaw(name, tokens)
 
 	return diags
+}
+
+func generateConfigBlock(addr resourceAddr, typeName string, labels []string, vals map[resourceInstanceAddr]cty.Value, schema *tfjson.SchemaBlockType, body *hclwrite.Body) hcl.Diagnostics {
+	block := body.AppendNewBlock(typeName, labels)
+	return generateConfigBody(addr, vals, schema.Block, block.Body())
 }
