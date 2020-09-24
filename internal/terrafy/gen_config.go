@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/zclconf/go-cty/cty"
@@ -132,10 +133,104 @@ func generateConfigAttribute(addr resourceAddr, containerPath cty.Path, name str
 	// would typically write, so we'll just generate a straightforward
 	// (but very ugly) table lookup based on either count.index or each.key,
 	// depending on which repetition mode this resource uses.
+	var indexTraversal hcl.Traversal
+	var brackets [2]*hclwrite.Token
+	for k := range vals {
+		switch k.InstanceKey.(type) {
+		case int:
+			indexTraversal = hcl.Traversal{
+				hcl.TraverseRoot{Name: "count"},
+				hcl.TraverseAttr{Name: "index"},
+			}
+			brackets[0] = &hclwrite.Token{
+				Type:  hclsyntax.TokenOBrack,
+				Bytes: []byte{'['},
+			}
+			brackets[1] = &hclwrite.Token{
+				Type:  hclsyntax.TokenCBrack,
+				Bytes: []byte{']'},
+			}
+		case string:
+			indexTraversal = hcl.Traversal{
+				hcl.TraverseRoot{Name: "each"},
+				hcl.TraverseAttr{Name: "key"},
+			}
+			brackets[0] = &hclwrite.Token{
+				Type:  hclsyntax.TokenOBrace,
+				Bytes: []byte{'{'},
+			}
+			brackets[1] = &hclwrite.Token{
+				Type:  hclsyntax.TokenCBrace,
+				Bytes: []byte{'}'},
+			}
+		default:
+			panic(fmt.Sprintf("unexpected instance key type %T", k.InstanceKey))
+		}
+		break
+	}
+	indexTokens := hclwrite.TokensForTraversal(indexTraversal)
 
-	// TODO: Actually implement that dynamic lookup. For now, this is just
-	// a stub.
-	body.SetAttributeValue(name, cty.NullVal(cty.DynamicPseudoType))
+	keys := make([]interface{}, 0, len(vals))
+	vVals := make(map[interface{}]cty.Value, len(vals))
+	for addr, v := range vals {
+		keys = append(keys, addr.InstanceKey)
+		vVals[addr.InstanceKey] = v
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		iInt, iIsInt := keys[i].(int)
+		jInt, jIsInt := keys[j].(int)
+		iStr, _ := keys[i].(string)
+		jStr, _ := keys[j].(string)
+		switch {
+		case iIsInt != jIsInt:
+			return iIsInt
+		case iIsInt:
+			return iInt < jInt
+		default:
+			return iStr < jStr
+		}
+	})
+
+	var tokens hclwrite.Tokens
+	tokens = append(tokens, brackets[0])
+	tokens = append(tokens, &hclwrite.Token{
+		Type:  hclsyntax.TokenNewline,
+		Bytes: []byte{'\n'},
+	})
+	for _, key := range keys {
+		val := vVals[key]
+		if keyStr, isStr := key.(string); isStr {
+			kToks := hclwrite.TokensForValue(cty.StringVal(keyStr))
+			tokens = append(tokens, kToks...)
+			tokens = append(tokens, &hclwrite.Token{
+				Type:  hclsyntax.TokenEqual,
+				Bytes: []byte{'='},
+			})
+		}
+
+		vToks := hclwrite.TokensForValue(val)
+		tokens = append(tokens, vToks...)
+		tokens = append(tokens, &hclwrite.Token{
+			Type:  hclsyntax.TokenComma,
+			Bytes: []byte{','},
+		})
+		tokens = append(tokens, &hclwrite.Token{
+			Type:  hclsyntax.TokenNewline,
+			Bytes: []byte{'\n'},
+		})
+	}
+	tokens = append(tokens, brackets[1])
+	tokens = append(tokens, &hclwrite.Token{
+		Type:  hclsyntax.TokenOBrack,
+		Bytes: []byte{'['},
+	})
+	tokens = append(tokens, indexTokens...)
+	tokens = append(tokens, &hclwrite.Token{
+		Type:  hclsyntax.TokenCBrack,
+		Bytes: []byte{']'},
+	})
+
+	body.SetAttributeRaw(name, tokens)
 
 	return diags
 }
